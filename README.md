@@ -2,8 +2,8 @@
 Pomodoro timer application with additional features.
 
 ## Technologies
-- (https://rust-lang.org/)[Rust]
-- (https://ratatui.rs/)[Ratatui]
+- [Rust](https://rust-lang.org/)
+- [Ratatui](https://ratatui.rs/)
 
 ## Run and build
 Build the application with:

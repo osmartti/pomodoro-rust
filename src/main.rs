@@ -1,10 +1,12 @@
+use std::time::{Duration, Instant};
+
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text, ToSpan};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::text::{Line, Span, Text, ToSpan};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 #[derive(PartialEq, Eq)]
@@ -23,7 +25,7 @@ const THEMES: [Theme; 5] = [
     Theme {
         name: "BASIC",
         main_color: Color::White,
-        accent_color: Color::White,
+        accent_color: Color::Gray,
     },
     Theme {
         name: "MIAMI",
@@ -57,6 +59,13 @@ struct App {
     main_color: Color,
     accent_color: Color,
     mode: Mode,
+    timer_duration: Duration,
+    work_category: String,
+    work_time_duration: Duration,
+    break_time_duration: Duration,
+    is_timer_running: bool,
+    should_start_break_timer: bool,
+    should_quit_timer: bool,
 }
 
 impl App {
@@ -78,6 +87,13 @@ impl App {
             main_color: Color::White,
             accent_color: Color::White,
             mode: Mode::OUTER,
+            timer_duration: Duration::from_secs(0),
+            work_category: "Basic Work".to_owned(),
+            work_time_duration: Duration::from_secs(1500),
+            break_time_duration: Duration::from_secs(300),
+            is_timer_running: false,
+            should_start_break_timer: false,
+            should_quit_timer: false,
         }
     }
 
@@ -107,6 +123,17 @@ impl App {
         }
     }
 
+    fn tick_timer(&mut self, elapsed: Duration) {
+        if self.is_timer_running {
+            if self.timer_duration > elapsed {
+                self.timer_duration -= elapsed;
+            } else {
+                self.timer_duration = Duration::from_secs(0);
+                self.is_timer_running = false;
+            }
+        }
+    }
+
     fn set_inner_actions(&mut self, new_actions: Vec<String>) {
         self.inner_actions = new_actions;
     }
@@ -119,9 +146,22 @@ impl App {
             }
             self.current_tab = self.selected;
             self.mode = Mode::INNER;
+            match self.selected {
+                1 => {
+                    if self.is_timer_running == false {
+                        self.timer_duration =
+                            Duration::from_secs(self.work_time_duration.as_secs());
+                        self.is_timer_running = true;
+                    }
+                }
+                _ => {}
+            }
         } else {
-            match self.inner_selected {
-                2 => self.change_theme(),
+            match self.selected {
+                5 => match self.inner_selected {
+                    2 => self.change_theme(),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -157,28 +197,42 @@ fn main() -> Result<()> {
 
 fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let mut app = App::new();
+    let mut last_tick = Instant::now();
+    let duration: Duration = Duration::from_millis(100);
     loop {
         terminal.draw(|f| render(f, &mut app))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                event::KeyCode::Char('q') => {
-                    if app.mode == Mode::INNER {
-                        app.mode = Mode::OUTER;
-                        app.inner_selected = 0;
-                        ();
-                    } else {
-                        break Ok(());
+        if event::poll(duration)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        event::KeyCode::Char('q') => {
+                            if app.mode == Mode::INNER {
+                                app.mode = Mode::OUTER;
+                                app.inner_selected = 0;
+                                ();
+                            } else {
+                                break Ok(());
+                            }
+                        }
+                        event::KeyCode::Char('s') => {
+                            if app.is_timer_running {
+                                app.is_timer_running = false;
+                                app.timer_duration = app.work_time_duration;
+                            }
+                            // TODO: Render popup when timer is stopped
+                        }
+                        event::KeyCode::Up => app.previous(),
+                        event::KeyCode::Down => app.next(),
+                        event::KeyCode::Enter => app.handle_enter(),
+                        _ => {}
                     }
                 }
-                event::KeyCode::Up => app.previous(),
-                event::KeyCode::Down => app.next(),
-                event::KeyCode::Enter => app.handle_enter(),
-                _ => {}
             }
         }
+
+        let elapsed = last_tick.elapsed();
+        last_tick = Instant::now();
+        app.tick_timer(elapsed);
     }
 }
 
@@ -292,6 +346,19 @@ fn ascii_art(color: Color) -> Paragraph<'static> {
     return paragraph;
 }
 
+fn create_gauge(
+    gauge_percentage: f64,
+    label: &str,
+    fill_color: Color,
+    back_color: Color,
+) -> Gauge<'_> {
+    return Gauge::default()
+        .style(Modifier::BOLD)
+        .gauge_style(Style::new().fg(fill_color).bg(back_color))
+        .label(label)
+        .ratio(gauge_percentage);
+}
+
 // RENDER FUNCTIONS
 
 fn render_home_screen(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -308,6 +375,7 @@ fn render_home_screen(frame: &mut Frame, area: Rect, app: &mut App) {
     UP, DOWN -> navigate menu
     ENTER -> Select highlighted menu item
     q -> exit menu / quit the application
+    s -> stops the timer
 
     © osmartti 2026
     "#;
@@ -325,11 +393,40 @@ fn render_start_pomodoro(frame: &mut Frame, area: Rect, app: &mut App) {
     let pomodoro_timer_layout = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints(vec![Constraint::Min(7), Constraint::Percentage(75)])
+        .constraints(vec![
+            Constraint::Min(7),
+            Constraint::Percentage(75),
+            Constraint::Length(3),
+        ])
         .split(area);
 
+    // Timer text creation
+    let duration_seconds_remaining: u64 = app.timer_duration.as_secs();
+    let m: u64 = duration_seconds_remaining / 60;
+    let s: u64 = duration_seconds_remaining % 60;
+    let duration_string = Line::from(vec![
+        Span::styled("Doing ", Style::default().fg(app.main_color)),
+        Span::styled(
+            format!("{:02}", app.work_category),
+            Style::default().fg(app.accent_color),
+        ),
+        Span::styled(" for ", Style::default().fg(app.main_color)),
+        Span::styled(
+            format!("{:02}:{:02}", m, s),
+            Style::default().fg(app.accent_color),
+        ),
+    ]);
+
+    // Progress Cauge creation
+    let ratio: f64 = if app.work_time_duration.as_secs_f64() > 0.0 {
+        1.0 - app.timer_duration.as_secs_f64() / app.work_time_duration.as_secs_f64()
+    } else {
+        0.0
+    };
+    let progress_gauge: Gauge = create_gauge(ratio, "Test title", app.accent_color, app.main_color);
     frame.render_widget(ascii_art(app.accent_color), pomodoro_timer_layout[0]);
-    frame.render_widget(Paragraph::new("Start Pomodoro"), pomodoro_timer_layout[1]);
+    frame.render_widget(Paragraph::new(duration_string), pomodoro_timer_layout[1]);
+    frame.render_widget(progress_gauge, pomodoro_timer_layout[2]);
 }
 
 fn render_daily_stats(frame: &mut Frame, area: Rect) {
