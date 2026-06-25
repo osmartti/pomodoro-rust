@@ -1,5 +1,9 @@
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -65,7 +69,8 @@ struct App {
     break_time_duration: Duration,
     is_timer_running: bool,
     should_start_break_timer: bool,
-    should_quit_timer: bool,
+    stats_path: String,
+    should_add_entry: bool,
 }
 
 impl App {
@@ -89,11 +94,12 @@ impl App {
             mode: Mode::OUTER,
             timer_duration: Duration::from_secs(0),
             work_category: "Basic Work".to_owned(),
-            work_time_duration: Duration::from_secs(1500),
-            break_time_duration: Duration::from_secs(300),
+            work_time_duration: Duration::from_mins(25), //1500
+            break_time_duration: Duration::from_mins(5), //300
             is_timer_running: false,
             should_start_break_timer: false,
-            should_quit_timer: false,
+            stats_path: "/".to_owned(),
+            should_add_entry: false,
         }
     }
 
@@ -128,8 +134,14 @@ impl App {
             if self.timer_duration > elapsed {
                 self.timer_duration -= elapsed;
             } else {
-                self.timer_duration = Duration::from_secs(0);
-                self.is_timer_running = false;
+                if self.should_start_break_timer {
+                    self.timer_duration = self.break_time_duration;
+                    self.should_start_break_timer = false;
+                    self.should_add_entry = true;
+                } else {
+                    self.timer_duration = Duration::from_secs(0);
+                    self.is_timer_running = false;
+                }
             }
         }
     }
@@ -152,6 +164,7 @@ impl App {
                         self.timer_duration =
                             Duration::from_secs(self.work_time_duration.as_secs());
                         self.is_timer_running = true;
+                        self.should_start_break_timer = true;
                     }
                 }
                 _ => {}
@@ -159,7 +172,10 @@ impl App {
         } else {
             match self.selected {
                 5 => match self.inner_selected {
-                    2 => self.change_theme(),
+                    4 => {
+                        let new_theme_index: u8 = self.theme_idx + 1;
+                        self.change_theme(new_theme_index);
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -167,11 +183,10 @@ impl App {
         }
     }
 
-    fn change_theme(&mut self) {
-        let mut theme: u8 = self.theme_idx;
+    fn change_theme(&mut self, new_theme_index: u8) {
         let max_theme_idx: u8 = THEMES.len() as u8;
-        theme = theme + 1;
-        if theme > max_theme_idx - 1 {
+        let mut theme: u8 = new_theme_index;
+        if new_theme_index > max_theme_idx - 1 {
             theme = 0
         }
         self.theme_idx = theme;
@@ -189,6 +204,8 @@ impl App {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    create_pomdoro_stats_file()?;
+    create_config_file()?;
     let terminal = ratatui::init();
     let result = run(terminal);
     ratatui::restore();
@@ -197,6 +214,7 @@ fn main() -> Result<()> {
 
 fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let mut app = App::new();
+    initialize_from_settings(&mut app)?;
     let mut last_tick = Instant::now();
     let duration: Duration = Duration::from_millis(100);
     loop {
@@ -209,6 +227,9 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
                             if app.mode == Mode::INNER {
                                 app.mode = Mode::OUTER;
                                 app.inner_selected = 0;
+                                if app.selected == 5 {
+                                    save_settings(&mut app)?;
+                                }
                                 ();
                             } else {
                                 break Ok(());
@@ -216,6 +237,7 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
                         }
                         event::KeyCode::Char('s') => {
                             if app.is_timer_running {
+                                app.should_start_break_timer = true;
                                 app.is_timer_running = false;
                                 app.timer_duration = app.work_time_duration;
                             }
@@ -233,6 +255,10 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
         let elapsed = last_tick.elapsed();
         last_tick = Instant::now();
         app.tick_timer(elapsed);
+        if app.should_add_entry {
+            app.should_add_entry = false;
+            add_entry(&mut app)?;
+        }
     }
 }
 
@@ -329,6 +355,94 @@ fn create_list<'a>(
         .highlight_symbol("> ");
 }
 
+fn create_pomdoro_stats_file() -> Result<()> {
+    match File::open("pomodoro_stats.csv") {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let mut new_file = OpenOptions::new()
+                .append(true)
+                .write(true)
+                .read(true)
+                .create(true)
+                .open("pomodoro_stats.csv")?;
+            return Ok(new_file.write_all(b"date;category;work_minutes;break_minutes\n")?);
+        }
+    }
+}
+
+fn create_config_file() -> Result<()> {
+    match OpenOptions::new().read(true).open("pomodoro_config") {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let mut new_config_file = OpenOptions::new()
+                .append(true)
+                .write(true)
+                .read(true)
+                .create(true)
+                .open("pomodoro_config")?;
+            return Ok(new_config_file.write_all(b"THEME=0\nSTATS_PATH=/\nDEFAULT_CATEGORY=Basic Work\nDEFAULT_WORK_MINUTES=25\nDEFAULT_BREAK_MINUTES=5")?);
+        }
+    }
+}
+
+fn save_settings(app: &mut App) -> Result<()> {
+    let theme_index = app.theme_idx;
+    let working_minutes = app.work_time_duration.as_secs() / 60;
+    let break_minutes = app.break_time_duration.as_secs() / 60;
+    let stats_path = app.stats_path.clone();
+    let work_category = app.work_category.clone();
+    let config_content = format!(
+        "THEME={}\nSTATS_PATH={}\nDEFAULT_CATEGORY={}\nDEFAULT_WORK_MINUTES={}\nDEFAULT_BREAK_MINUTES={}",
+        theme_index, stats_path, work_category, working_minutes, break_minutes
+    );
+    let mut config_file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open("pomodoro_config")?;
+    return Ok(config_file.write_all(config_content.as_bytes())?);
+}
+
+fn initialize_from_settings(app: &mut App) -> Result<()> {
+    let config_file_content = std::fs::read_to_string("pomodoro_config")?;
+    let lines = config_file_content.lines();
+    for line in lines {
+        if let Some((key, value)) = line.split_once("=") {
+            match key {
+                "THEME" => {
+                    app.theme_idx = value.parse()?;
+                    app.change_theme(app.theme_idx);
+                }
+                "nSTATS_PATH" => {
+                    app.stats_path = value.to_owned();
+                }
+                "DEFAULT_WORK_MINUTES" => {
+                    app.work_time_duration = Duration::from_mins(value.parse()?);
+                }
+                "DEFAULT_BREAK_MINUTES" => {
+                    app.break_time_duration = Duration::from_mins(value.parse()?);
+                }
+                "DEFAULT_CATEGORY" => {
+                    app.work_category = value.to_owned();
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_entry(app: &mut App) -> Result<()> {
+    let date = Local::now().format("%Y-%m-%d").to_string();
+    let category = app.work_category.clone();
+    let work_minutes = app.work_time_duration.as_secs() / 60;
+    let break_minutes = app.break_time_duration.as_secs() / 60;
+    let entry_content = format!("{};{};{};{}\n", date, category, work_minutes, break_minutes);
+    return Ok(OpenOptions::new()
+        .append(true)
+        .open("pomodoro_stats.csv")?
+        .write_all(entry_content.as_bytes())?);
+}
+
 fn ascii_art(color: Color) -> Paragraph<'static> {
     let pomodoro_ascii = r#"
 ██████╗  ██████╗ ███╗   ███╗ ██████╗ ██████╗  ██████╗ ██████╗  ██████╗ 
@@ -404,18 +518,37 @@ fn render_start_pomodoro(frame: &mut Frame, area: Rect, app: &mut App) {
     let duration_seconds_remaining: u64 = app.timer_duration.as_secs();
     let m: u64 = duration_seconds_remaining / 60;
     let s: u64 = duration_seconds_remaining % 60;
-    let duration_string = Line::from(vec![
-        Span::styled("Doing ", Style::default().fg(app.main_color)),
-        Span::styled(
-            format!("{:02}", app.work_category),
-            Style::default().fg(app.accent_color),
-        ),
-        Span::styled(" for ", Style::default().fg(app.main_color)),
-        Span::styled(
-            format!("{:02}:{:02}", m, s),
-            Style::default().fg(app.accent_color),
-        ),
-    ]);
+    let duration_string: Line;
+    if app.should_start_break_timer {
+        duration_string = Line::from(vec![
+            Span::styled("Doing ", Style::default().fg(app.main_color)),
+            Span::styled(
+                format!("{:02}", app.work_category),
+                Style::default().fg(app.accent_color),
+            ),
+            Span::styled(" for ", Style::default().fg(app.main_color)),
+            Span::styled(
+                format!("{:02}:{:02}", m, s),
+                Style::default().fg(app.accent_color),
+            ),
+        ]);
+    } else if app.should_start_break_timer == false && app.timer_duration.as_secs() > 0 {
+        duration_string = Line::from(vec![
+            Span::styled(
+                "Break time! Having a break for ",
+                Style::default().fg(app.main_color),
+            ),
+            Span::styled(
+                format!("{:02}:{:02}", m, s),
+                Style::default().fg(app.accent_color),
+            ),
+        ]);
+    } else {
+        duration_string = Line::from(vec![Span::styled(
+            "All done!",
+            Style::default().fg(app.main_color),
+        )]);
+    }
 
     // Progress Cauge creation
     let ratio: f64 = if app.work_time_duration.as_secs_f64() > 0.0 {
@@ -423,7 +556,7 @@ fn render_start_pomodoro(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         0.0
     };
-    let progress_gauge: Gauge = create_gauge(ratio, "Test title", app.accent_color, app.main_color);
+    let progress_gauge: Gauge = create_gauge(ratio, "", app.accent_color, app.main_color);
     frame.render_widget(ascii_art(app.accent_color), pomodoro_timer_layout[0]);
     frame.render_widget(Paragraph::new(duration_string), pomodoro_timer_layout[1]);
     frame.render_widget(progress_gauge, pomodoro_timer_layout[2]);
@@ -444,9 +577,21 @@ fn render_lifetime_stats(frame: &mut Frame, area: Rect) {
 fn render_settings(frame: &mut Frame, area: Rect, app: &mut App) {
     let current_theme: &Theme = &THEMES[app.theme_idx as usize];
     let theme_string: String = "Theme: ".to_owned() + current_theme.name;
+    let stats_path: String = format!("Stats Path: {}", app.stats_path);
+    let category: String = format!("Default Category: {}", app.work_category);
+    let work_minutes: String = format!(
+        "Default Work Minutes: {}",
+        app.work_time_duration.as_secs() / 60,
+    );
+    let break_minutes: String = format!(
+        "Default Break Minutes: {}",
+        app.break_time_duration.as_secs() / 60,
+    );
     let settings_actions: Vec<String> = vec![
-        String::from("Default Work Minutes: 25"),
-        String::from("Default Break Minutes: 5"),
+        stats_path,
+        category,
+        work_minutes,
+        break_minutes,
         theme_string,
     ];
     app.set_inner_actions(settings_actions);
