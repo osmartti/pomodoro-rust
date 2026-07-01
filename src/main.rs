@@ -3,14 +3,16 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{Duration as ChronoDuration, Local};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text, ToSpan};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Cell, Gauge, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+};
 use ratatui::{DefaultTerminal, Frame};
 
 #[derive(PartialEq, Eq)]
@@ -25,7 +27,7 @@ struct Theme {
     accent_color: Color,
 }
 
-const THEMES: [Theme; 5] = [
+const THEMES: [Theme; 7] = [
     Theme {
         name: "BASIC",
         main_color: Color::White,
@@ -33,8 +35,8 @@ const THEMES: [Theme; 5] = [
     },
     Theme {
         name: "MIAMI",
-        main_color: Color::Magenta,
-        accent_color: Color::Yellow,
+        main_color: Color::Indexed(206),
+        accent_color: Color::Indexed(050),
     },
     Theme {
         name: "MATRIX",
@@ -51,7 +53,19 @@ const THEMES: [Theme; 5] = [
         main_color: Color::Red,
         accent_color: Color::LightRed,
     },
+    Theme {
+        name: "SAKURA",
+        main_color: Color::Indexed(219),
+        accent_color: Color::Indexed(231),
+    },
+    Theme {
+        name: "NIPPON",
+        main_color: Color::White,
+        accent_color: Color::Red,
+    },
 ];
+
+const POMODORO_HEADERS: &[&str] = &["Date", "Category", "Working min.", "Break min."];
 
 struct App {
     actions: Vec<&'static str>,
@@ -59,7 +73,7 @@ struct App {
     selected: usize,
     inner_selected: usize,
     current_tab: usize,
-    theme_idx: u8,
+    theme_idx: i8,
     main_color: Color,
     accent_color: Color,
     mode: Mode,
@@ -71,6 +85,7 @@ struct App {
     should_start_break_timer: bool,
     stats_path: String,
     should_add_entry: bool,
+    pomodoro_entries: Vec<Vec<String>>,
 }
 
 impl App {
@@ -78,7 +93,7 @@ impl App {
         Self {
             actions: vec![
                 "Home",
-                "Start Pomodoro",
+                "Pomodoro Session",
                 "Daily Stats",
                 "Weekly Stats",
                 "Lifetime Stats",
@@ -100,6 +115,7 @@ impl App {
             should_start_break_timer: false,
             stats_path: "/".to_owned(),
             should_add_entry: false,
+            pomodoro_entries: vec![],
         }
     }
 
@@ -173,7 +189,7 @@ impl App {
             match self.selected {
                 5 => match self.inner_selected {
                     4 => {
-                        let new_theme_index: u8 = self.theme_idx + 1;
+                        let new_theme_index: i8 = self.theme_idx + 1;
                         self.change_theme(new_theme_index);
                     }
                     _ => {}
@@ -183,11 +199,62 @@ impl App {
         }
     }
 
-    fn change_theme(&mut self, new_theme_index: u8) {
-        let max_theme_idx: u8 = THEMES.len() as u8;
-        let mut theme: u8 = new_theme_index;
-        if new_theme_index > max_theme_idx - 1 {
-            theme = 0
+    fn increase_value(&mut self) {
+        // Check if settings are selected
+        if self.selected == 5 {
+            match self.inner_selected {
+                2 => {
+                    self.work_time_duration =
+                        Duration::from_secs(self.work_time_duration.as_secs() + 60)
+                }
+                3 => {
+                    self.break_time_duration =
+                        Duration::from_secs(self.break_time_duration.as_secs() + 60)
+                }
+                4 => {
+                    let new_theme_index: i8 = self.theme_idx + 1;
+                    self.change_theme(new_theme_index);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn decrease_value(&mut self) {
+        // Check if settings are selected
+        if self.selected == 5 {
+            match self.inner_selected {
+                2 => {
+                    if self.work_time_duration.as_secs() == 60 {
+                        return;
+                    }
+                    self.work_time_duration =
+                        Duration::from_secs(self.work_time_duration.as_secs() - 60)
+                }
+                3 => {
+                    if self.break_time_duration.as_secs() == 60 {
+                        return;
+                    }
+                    self.break_time_duration =
+                        Duration::from_secs(self.break_time_duration.as_secs() - 60)
+                }
+                4 => {
+                    let new_theme_index: i8 = self.theme_idx - 1;
+                    self.change_theme(new_theme_index);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn change_theme(&mut self, new_theme_index: i8) {
+        let max_theme_idx: i8 = THEMES.len() as i8 - 1;
+        let mut theme: i8 = new_theme_index;
+        if new_theme_index > max_theme_idx {
+            theme = 0;
+        }
+        if new_theme_index < 0 {
+            theme = max_theme_idx;
         }
         self.theme_idx = theme;
         self.apply_theme(
@@ -199,6 +266,28 @@ impl App {
     fn apply_theme(&mut self, mcolor: Color, acolor: Color) {
         self.main_color = mcolor;
         self.accent_color = acolor;
+    }
+
+    fn daily_entries(&self) -> Vec<Vec<String>> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        self.pomodoro_entries
+            .iter()
+            .filter(|row| row[0] == today)
+            .cloned()
+            .collect()
+    }
+
+    fn weekly_entries(&self) -> Vec<Vec<String>> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let week_ago = (Local::now() - ChronoDuration::days(7))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        self.pomodoro_entries
+            .iter()
+            .filter(|row| row[0] >= week_ago && row[0] <= today)
+            .cloned()
+            .collect()
     }
 }
 
@@ -217,6 +306,7 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
     initialize_from_settings(&mut app)?;
     let mut last_tick = Instant::now();
     let duration: Duration = Duration::from_millis(100);
+    app.pomodoro_entries = read_pomodoro_entries()?;
     loop {
         terminal.draw(|f| render(f, &mut app))?;
         if event::poll(duration)? {
@@ -245,6 +335,8 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
                         }
                         event::KeyCode::Up => app.previous(),
                         event::KeyCode::Down => app.next(),
+                        event::KeyCode::Right => app.increase_value(),
+                        event::KeyCode::Left => app.decrease_value(),
                         event::KeyCode::Enter => app.handle_enter(),
                         _ => {}
                     }
@@ -258,6 +350,7 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
         if app.should_add_entry {
             app.should_add_entry = false;
             add_entry(&mut app)?;
+            app.pomodoro_entries = read_pomodoro_entries()?;
         }
     }
 }
@@ -278,8 +371,18 @@ fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Block::bordered()
             .fg(app.main_color)
-            .title_bottom(" © osmartti 2026 ".to_span().into_centered_line())
-            .title(" POMODORO ".to_span().into_centered_line()),
+            .title_bottom(
+                " © osmartti 2026 "
+                    .to_span()
+                    .into_centered_line()
+                    .fg(app.accent_color),
+            )
+            .title(
+                " POMODORO "
+                    .to_span()
+                    .into_centered_line()
+                    .fg(app.accent_color),
+            ),
         outer_layout[0],
     );
 
@@ -321,8 +424,8 @@ fn render(frame: &mut Frame, app: &mut App) {
     match app.current_tab {
         0 => render_home_screen(frame, inner_layout_block_area, app),
         1 => render_start_pomodoro(frame, inner_layout_block_area, app),
-        2 => render_daily_stats(frame, inner_layout_block_area),
-        3 => render_weekly_stats(frame, inner_layout_block_area),
+        2 => render_daily_stats(frame, inner_layout_block_area, app),
+        3 => render_weekly_stats(frame, inner_layout_block_area, app),
         4 => render_lifetime_stats(frame, inner_layout_block_area),
         5 => render_settings(frame, inner_layout_block_area, app),
         _ => {}
@@ -443,6 +546,16 @@ fn add_entry(app: &mut App) -> Result<()> {
         .write_all(entry_content.as_bytes())?);
 }
 
+fn read_pomodoro_entries() -> Result<Vec<Vec<String>>> {
+    let file_content = std::fs::read_to_string("pomodoro_stats.csv")?;
+    let rows = file_content
+        .lines()
+        .skip(1)
+        .map(|line| line.split(";").map(|col| col.to_owned()).collect())
+        .collect();
+    Ok(rows)
+}
+
 fn ascii_art(color: Color) -> Paragraph<'static> {
     let pomodoro_ascii = r#"
 ██████╗  ██████╗ ███╗   ███╗ ██████╗ ██████╗  ██████╗ ██████╗  ██████╗ 
@@ -471,6 +584,32 @@ fn create_gauge(
         .gauge_style(Style::new().fg(fill_color).bg(back_color))
         .label(label)
         .ratio(gauge_percentage);
+}
+
+fn create_table(
+    headers: &[&'static str],
+    row_data: Vec<Vec<String>>,
+    text_color: Color,
+    header_color: Color,
+) -> Table<'static> {
+    let header = Row::new(headers.iter().map(|h| Cell::from(*h)))
+        .style(Style::new().bold().fg(header_color))
+        .bottom_margin(1);
+
+    let mut rows: Vec<Row> = vec![];
+    for entry in row_data {
+        rows.push(Row::new(entry));
+    }
+    let widths = [
+        Constraint::Percentage(30),
+        Constraint::Percentage(50),
+        Constraint::Percentage(10),
+        Constraint::Percentage(10),
+    ];
+    return Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .style(text_color);
 }
 
 // RENDER FUNCTIONS
@@ -518,6 +657,7 @@ fn render_start_pomodoro(frame: &mut Frame, area: Rect, app: &mut App) {
     let duration_seconds_remaining: u64 = app.timer_duration.as_secs();
     let m: u64 = duration_seconds_remaining / 60;
     let s: u64 = duration_seconds_remaining % 60;
+    let mut ratio: f64 = 0.0;
     let duration_string: Line;
     if app.should_start_break_timer {
         duration_string = Line::from(vec![
@@ -532,6 +672,11 @@ fn render_start_pomodoro(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(app.accent_color),
             ),
         ]);
+        ratio = if app.work_time_duration.as_secs_f64() > 0.0 {
+            1.0 - app.timer_duration.as_secs_f64() / app.work_time_duration.as_secs_f64()
+        } else {
+            0.0
+        };
     } else if app.should_start_break_timer == false && app.timer_duration.as_secs() > 0 {
         duration_string = Line::from(vec![
             Span::styled(
@@ -543,31 +688,44 @@ fn render_start_pomodoro(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(app.accent_color),
             ),
         ]);
+        ratio = if app.break_time_duration.as_secs_f64() > 0.0 {
+            1.0 - app.timer_duration.as_secs_f64() / app.break_time_duration.as_secs_f64()
+        } else {
+            0.0
+        };
     } else {
         duration_string = Line::from(vec![Span::styled(
             "All done!",
             Style::default().fg(app.main_color),
         )]);
+        ratio = 1.0;
     }
 
     // Progress Cauge creation
-    let ratio: f64 = if app.work_time_duration.as_secs_f64() > 0.0 {
-        1.0 - app.timer_duration.as_secs_f64() / app.work_time_duration.as_secs_f64()
-    } else {
-        0.0
-    };
     let progress_gauge: Gauge = create_gauge(ratio, "", app.accent_color, app.main_color);
     frame.render_widget(ascii_art(app.accent_color), pomodoro_timer_layout[0]);
     frame.render_widget(Paragraph::new(duration_string), pomodoro_timer_layout[1]);
     frame.render_widget(progress_gauge, pomodoro_timer_layout[2]);
 }
 
-fn render_daily_stats(frame: &mut Frame, area: Rect) {
-    frame.render_widget(Paragraph::new("Daily Stats"), area);
+fn render_daily_stats(frame: &mut Frame, area: Rect, app: &mut App) {
+    let table = create_table(
+        POMODORO_HEADERS,
+        app.daily_entries(),
+        app.accent_color,
+        app.main_color,
+    );
+    frame.render_widget(table, area);
 }
 
-fn render_weekly_stats(frame: &mut Frame, area: Rect) {
-    frame.render_widget(Paragraph::new("Weekly Stats"), area);
+fn render_weekly_stats(frame: &mut Frame, area: Rect, app: &mut App) {
+    let table = create_table(
+        POMODORO_HEADERS,
+        app.weekly_entries(),
+        app.accent_color,
+        app.main_color,
+    );
+    frame.render_widget(table, area);
 }
 
 fn render_lifetime_stats(frame: &mut Frame, area: Rect) {
